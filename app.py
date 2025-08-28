@@ -16,6 +16,7 @@ import torch
 from tools.painter import mask_painter
 import psutil
 import time
+from fractions import Fraction
 try: 
     from mmcv.cnn import ConvModule
 except:
@@ -86,6 +87,7 @@ def get_frames_from_video(video_input, video_state):
     try:
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(fps)
         while cap.isOpened():
             ret, frame = cap.read()
             if ret == True:
@@ -157,7 +159,91 @@ def get_resize_ratio(resize_ratio_slider, interactive_state):
     interactive_state["resize_ratio"] = resize_ratio_slider
 
     return interactive_state
+def generate_video_from_frames(frames, output_path, fps):
+    # -------- 1) 统一到 [T, H, W, C]、uint8 --------
+    if isinstance(frames, list):
+        frames = [np.asarray(f) for f in frames]
+        frames = [f if f.dtype == np.uint8 else np.clip(f, 0, 255).astype(np.uint8) for f in frames]
+        frames = np.stack(frames, axis=0)
+    elif isinstance(frames, np.ndarray):
+        if frames.ndim == 3:  # [H, W, C] -> [1, H, W, C]
+            frames = frames[None, ...]
+        if frames.dtype != np.uint8:
+            frames = np.clip(frames, 0, 255).astype(np.uint8)
+    elif torch.is_tensor(frames):
+        frames = frames.detach().cpu()
+        if frames.dim() == 3:  # [H, W, C] -> [1, H, W, C]
+            frames = frames.unsqueeze(0)
+        if frames.dtype != torch.uint8:
+            frames = frames.clamp(0, 255).to(torch.uint8)
+        frames = frames.numpy()
+    else:
+        raise TypeError("frames 必须是 list / np.ndarray / torch.Tensor")
 
+    # [T, C, H, W] -> [T, H, W, C]
+    if frames.ndim != 4:
+        raise ValueError(f"frames 维度应为 4，但得到 {frames.shape}")
+    if frames.shape[-1] != 3:
+        if frames.shape[1] == 3:
+            frames = np.transpose(frames, (0, 2, 3, 1))
+        else:
+            raise ValueError(f"期望最后一维为 3（RGB），实际为 {frames.shape}")
+
+    # yuv420p 要求宽高为偶数，必要时做1像素填充
+    H, W = frames.shape[1], frames.shape[2]
+    pad_h = H % 2
+    pad_w = W % 2
+    if pad_h or pad_w:
+        frames = np.pad(frames, ((0,0),(0,pad_h),(0,pad_w),(0,0)), mode="edge")
+        H += pad_h; W += pad_w
+
+    frames_torch = torch.from_numpy(frames).contiguous()
+
+    # -------- 2) FPS：用 Fraction，避免 numpy 标量惹事 --------
+    fps_rational = Fraction(float(fps)).limit_denominator(1001)
+
+    # -------- 3) 路径 --------
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    root, ext = os.path.splitext(output_path)
+    if not ext:
+        output_path = root + ".mp4"
+
+    # -------- 4) 首选 torchvision；失败则自动降级到 PyAV --------
+    try:
+        torchvision.io.write_video(
+            output_path,
+            frames_torch,
+            fps=fps_rational,
+            video_codec="libx264",
+            options={"pix_fmt": "yuv420p"}  # 兼容性更好
+        )
+    except TypeError as e:
+        # 典型不兼容：frame.pict_type 需要整数
+        if "pict_type" in str(e) or "integer is required" in str(e):
+            import av
+            from av.video.frame import PictureType  # 整数枚举
+            container = av.open(output_path, mode="w")
+            try:
+                stream = container.add_stream("libx264", rate=fps_rational)
+                stream.width, stream.height = W, H
+                stream.pix_fmt = "yuv420p"
+
+                for img in frames:  # img: [H, W, 3] uint8
+                    frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+                    # 关键：在你的 PyAV 版本上用整数枚举
+                    frame.pict_type = PictureType.NONE
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+
+                for packet in stream.encode():  # flush
+                    container.mux(packet)
+            finally:
+                container.close()
+        else:
+            # 其他类型错误继续抛出，便于定位
+            raise
+
+    return output_path
 # use sam to get the mask
 def sam_refine(video_state, point_prompt, click_state, interactive_state, evt:gr.SelectData):
     """
@@ -326,29 +412,7 @@ def inpaint_video(video_state, interactive_state, mask_dropdown):
     return video_output, operation_log
 
 
-# generate video after vos inference
-def generate_video_from_frames(frames, output_path, fps=30):
-    """
-    Generates a video from a list of frames.
-    
-    Args:
-        frames (list of numpy arrays): The frames to include in the video.
-        output_path (str): The path to save the generated video.
-        fps (int, optional): The frame rate of the output video. Defaults to 30.
-    """
-    # height, width, layers = frames[0].shape
-    # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    # video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    # print(output_path)
-    # for frame in frames:
-    #     video.write(frame)
-    
-    # video.release()
-    frames = torch.from_numpy(np.asarray(frames))
-    if not os.path.exists(os.path.dirname(output_path)):
-        os.makedirs(os.path.dirname(output_path))
-    torchvision.io.write_video(output_path, frames, fps=fps, video_codec="libx264")
-    return output_path
+
 
 
 # args, defined in track_anything.py
@@ -378,7 +442,7 @@ SAM_checkpoint = download_checkpoint(sam_checkpoint_url, folder, sam_checkpoint)
 xmem_checkpoint = download_checkpoint(xmem_checkpoint_url, folder, xmem_checkpoint)
 e2fgvi_checkpoint = download_checkpoint_from_google_drive(e2fgvi_checkpoint_id, folder, e2fgvi_checkpoint)
 args.port = 12212
-args.device = "cuda:3"
+args.device = "cuda:0"
 # args.mask_save = True
 
 # initialize sam, xmem, e2fgvi models
@@ -429,7 +493,7 @@ with gr.Blocks() as iface:
         # for user video input
         with gr.Column():
             with gr.Row(scale=0.4):
-                video_input = gr.Video(autosize=True)
+                video_input = gr.Video()
                 with gr.Column():
                     video_info = gr.Textbox(label="Video Info")
                     resize_info = gr.Textbox(value="If you want to use the inpaint function, it is best to git clone the repo and use a machine with more VRAM locally. \
@@ -454,16 +518,16 @@ with gr.Blocks() as iface:
                                 interactive=True,
                                 visible=False)
                             remove_mask_button = gr.Button(value="Remove mask", interactive=True, visible=False) 
-                            clear_button_click = gr.Button(value="Clear clicks", interactive=True, visible=False).style(height=160)
+                            clear_button_click = gr.Button(value="Clear clicks", interactive=True, visible=False)
                             Add_mask_button = gr.Button(value="Add mask", interactive=True, visible=False)
-                    template_frame = gr.Image(type="pil",interactive=True, elem_id="template_frame", visible=False).style(height=360)
+                    template_frame = gr.Image(type="pil",interactive=True, elem_id="template_frame", visible=False)
                     image_selection_slider = gr.Slider(minimum=1, maximum=100, step=1, value=1, label="Track start frame", visible=False)
                     track_pause_number_slider = gr.Slider(minimum=1, maximum=100, step=1, value=1, label="Track end frame", visible=False)
             
                 with gr.Column():
                     run_status = gr.HighlightedText(value=[("Text","Error"),("to be","Label 2"),("highlighted","Label 3")], visible=False)
                     mask_dropdown = gr.Dropdown(multiselect=True, value=[], label="Mask selection", info=".", visible=False)
-                    video_output = gr.Video(autosize=True, visible=False).style(height=360)
+                    video_output = gr.Video(visible=False,height=360)
                     with gr.Row():
                         tracking_video_predict_button = gr.Button(value="Tracking", visible=False)
                         inpaint_video_predict_button = gr.Button(value="Inpainting", visible=False)
@@ -597,6 +661,6 @@ with gr.Blocks() as iface:
         outputs=[video_input],
         # cache_examples=True,
     ) 
-iface.queue(concurrency_count=1)
-iface.launch(debug=True, enable_queue=True, server_port=args.port, server_name="0.0.0.0")
+
+iface.queue(2).launch(debug=True, server_port=args.port, server_name="0.0.0.0")
 # iface.launch(debug=True, enable_queue=True)
